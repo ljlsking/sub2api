@@ -1,0 +1,142 @@
+name: build-sub2api-from-pr
+
+# =============================================================================
+# 通用版：从「上游 PR」构建 sub2api 镜像并推送到 GHCR。
+# 本机无需 Docker / Go，全程在 GitHub 云端完成，HK 只需 docker pull。
+#
+# 一次性准备：
+#   1. Fork https://github.com/Wei-Shaw/sub2api 到你自己的账号
+#   2. 在 fork 中新建 .github/workflows/build-sub2api-from-pr.yml，粘贴本文件
+#   3. 提交
+#
+# 每次使用：
+#   仓库 Actions → build-sub2api-from-pr → Run workflow，填：
+#     - pr_number: 上游 PR 编号（例如 8139）；留空 = 用当前分支代码
+#     - image_tag: 镜像标签（例如 8139 或 patched-8139）
+#     - skip_frontend_typecheck: 默认勾选（跳过 vue-tsc，省内存/加速）
+#
+# 产物：ghcr.io/<你的用户名小写>/sub2api:<image_tag>
+#
+# ⚠️ GHCR 包默认私有。首次构建后到 GitHub → Packages → 该包 → Settings
+#    → Change visibility 改为 Public；或在 HK 上 docker login ghcr.io（用 PAT）。
+#
+# HK 侧使用：
+#   docker pull ghcr.io/<你的用户名>/sub2api:<tag>
+#   cd /opt/sub2api-hk
+#   sed -i 's#image: .*#image: ghcr.io/<你的用户名>/sub2api:<tag>#' docker-compose.yml
+#   docker compose up -d && docker compose ps
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '上游 PR 编号（留空则用当前分支代码）'
+        required: false
+        default: ''
+      image_tag:
+        description: '镜像标签（建议用 PR 号或语义化版本）'
+        required: true
+        default: 'patched'
+      skip_frontend_typecheck:
+        description: '跳过前端类型检查 vue-tsc（省内存、加速构建）'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-sub2api-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply upstream PR (if provided)
+        if: ${{ inputs.pr_number != '' }}
+        run: |
+          set -euo pipefail
+          # 兼容两种情况：本仓库是 fork（需从 upstream 取），或本体（从 origin 取）
+          if git remote get-url upstream >/dev/null 2>&1; then
+            REMOTE=upstream
+          elif git ls-remote --heads origin >/dev/null 2>&1 && \
+               git fetch origin "pull/${{ inputs.pr_number }}/head:pr-${{ inputs.pr_number }}" 2>/dev/null; then
+            REMOTE=origin
+          else
+            git remote add upstream https://github.com/Wei-Shaw/sub2api.git
+            REMOTE=upstream
+            git fetch upstream "pull/${{ inputs.pr_number }}/head:pr-${{ inputs.pr_number }}"
+          fi
+          git checkout "pr-${{ inputs.pr_number }}"
+          echo "=== 已切到 PR #${{ inputs.pr_number }} 的 head ==="
+          git log --oneline -5
+
+      - name: Show current revision
+        run: |
+          echo "commit: $(git rev-parse --short HEAD)"
+          git log -1 --pretty='%s'
+
+      - name: Skip frontend typecheck (optional, avoids OOM)
+        if: ${{ inputs.skip_frontend_typecheck }}
+        run: |
+          if grep -q 'RUN pnpm run build' Dockerfile; then
+            sed -i 's#RUN pnpm run build#RUN pnpm exec vite build#' Dockerfile
+            echo "已把前端构建改为纯 vite build（跳过 vue-tsc 类型检查）"
+          else
+            echo "未找到 'RUN pnpm run build'，跳过替换"
+          fi
+
+      - name: Compute lowercase image ref
+        id: img
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "ref=ghcr.io/${OWNER}/sub2api" >> "$GITHUB_OUTPUT"
+          echo "镜像地址：ghcr.io/${OWNER}/sub2api"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.img.outputs.ref }}:${{ inputs.image_tag }}
+            ${{ steps.img.outputs.ref }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 构建完成 ✅"
+            echo ""
+            echo "- 代码版本：\`$(git rev-parse --short HEAD)\`"
+            echo "- PR：#${{ inputs.pr_number || '未指定（当前分支）' }}"
+            echo "- 镜像：\`${{ steps.img.outputs.ref }}:${{ inputs.image_tag }}\`"
+            echo ""
+            echo "HK 上执行："
+            echo '```bash'
+            echo "docker pull ${{ steps.img.outputs.ref }}:${{ inputs.image_tag }}"
+            echo "cd /opt/sub2api-hk"
+            echo "sed -i 's#image: .*#image: ${{ steps.img.outputs.ref }}:${{ inputs.image_tag }}#' docker-compose.yml"
+            echo "docker compose up -d && docker compose ps"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
